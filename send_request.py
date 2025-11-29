@@ -1,7 +1,7 @@
 # send_request.py - test deployed solver
 import httpx
 
-ENDPOINT = "https://tds-project2-solver.onrender.com/api/quiz"
+ENDPOINT = "http://127.0.0.1:8000/api/quiz"
 
 payload = {
     "email": "24ds2000104@ds.study.iitm.ac.in",
