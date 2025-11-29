@@ -1,30 +1,23 @@
-# main.py — TDS Project 2 Solver (Option B: Minimal audio + fallback)
-# Deployment-ready version (NO hardcoded secrets)
-
 import os
 import re
-import io
 import json
-import time
 import base64
-import tempfile
 import asyncio
 import httpx
-from typing import Optional, Dict, Any
+import time
+import gzip
+import io
+import tempfile
+from typing import Dict, Any
+
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 
-# Optional heavy libs
+# Optional fallbacks
 try:
     import pdfplumber
 except:
     pdfplumber = None
-
-try:
-    import pandas as pd
-except:
-    pd = None
 
 try:
     from PIL import Image
@@ -33,120 +26,98 @@ except:
     Image = None
     pytesseract = None
 
-# -------------------------
-# CONFIG (deployment-safe)
-# -------------------------
-AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")                    # REQUIRED in Render
-AIPIPE_URL = os.getenv("AIPIPE_URL", "https://aipipe.org/openai/v1/chat/completions")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-nano")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1000"))
-SECRET_KEY = os.getenv("SECRET_KEY", "tds_24ds")            # MUST match client
-TOTAL_DEADLINE_SECONDS = int(os.getenv("TOTAL_DEADLINE_SECONDS", "180"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 
-app = FastAPI(title="TDS Project 2 Solver — Option B (Minimal audio)")
+# =====================================================
+# CONFIG
+# =====================================================
+AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
+OPENROUTER_URL = "https://aipipe.org/openrouter/v1/chat/completions"
+MODEL = "google/gemini-2.0-flash-lite-001"
 
-def log(*a): print(*a, flush=True)
+SECRET_KEY = os.getenv("SECRET_KEY", "tds_24ds")
+DEADLINE = 180
+MAX_RETRIES = 3
+
+app = FastAPI()
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+def log(*a):
+    print(*a, flush=True)
+
 
 def get_origin(url: str):
     from urllib.parse import urlparse
-    p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}"
+    u = urlparse(url)
+    return f"{u.scheme}://{u.netloc}"
 
-def decode_base64_flexible(s: str):
-    try:
-        s2 = re.sub(r"\s+", "", s)
-        s2 += "=" * ((4 - len(s2) % 4) % 4)
-        return base64.b64decode(s2).decode("utf-8", errors="replace")
-    except:
-        return ""
 
-def extract_text_and_decode(html: str):
+def abs_url(origin: str, u: str):
+    """Ensure u is a full URL."""
+    if not u:
+        return origin
+    if u.startswith("http"):
+        return u
+    if u.startswith("/"):
+        return origin + u
+    return origin + "/" + u
+
+
+def extract_text(html: str):
+    """Extract all visible text + atob decoded content."""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
-    for script in soup.find_all("script"):
-        s = script.string or ""
-        for m in re.finditer(r'atob\(`([^`]+)`\)', s):
-            text += "\n" + decode_base64_flexible(m.group(1))
-        for m in re.finditer(r'atob\("([^"]+)"\)', s):
-            text += "\n" + decode_base64_flexible(m.group(1))
+
+    for s in soup.find_all("script"):
+        code = s.string or ""
+        for m in re.finditer(r'atob\(`([^`]+)`\)', code):
+            b = m.group(1)
+            pad = "=" * ((4 - len(b) % 4) % 4)
+            try:
+                text += "\n" + base64.b64decode(b + pad).decode()
+            except:
+                pass
+
+        for m in re.finditer(r'atob\("([^"]+)"\)', code):
+            b = m.group(1)
+            pad = "=" * ((4 - len(b) % 4) % 4)
+            try:
+                text += "\n" + base64.b64decode(b + pad).decode()
+            except:
+                pass
+
     return text
 
-def safe_extract_json(s: str):
-    if not s: return None
+
+def safe_json(s: str):
+    """Extract first valid JSON object."""
     s = s.strip()
-    if s.startswith("{"):
-        try: json.loads(s); return s
-        except: pass
     start = s.find("{")
-    if start == -1: return None
+    if start == -1:
+        return None
     depth = 0
     for i in range(start, len(s)):
-        if s[i] == "{": depth += 1
+        if s[i] == "{":
+            depth += 1
         elif s[i] == "}":
             depth -= 1
             if depth == 0:
-                cand = s[start:i+1]
                 try:
-                    json.loads(cand)
-                    return cand
+                    return json.loads(s[start:i+1])
                 except:
                     return None
     return None
 
-# -------------------------
-# LLM Fallback (text only)
-# -------------------------
-def ask_llm_strict(page_text: str, page_url: str, email: str, secret: str):
-    if not AIPIPE_TOKEN:
-        return {"error": "no_aipipe_token"}
 
-    submit_url_expected = f"{get_origin(page_url)}/submit"
-    user_prompt = f"""
-Return ONLY one valid JSON object:
-{{
-  "answer": <value>,
-  "submit_url": "{submit_url_expected}",
-  "submit_payload": {{
-    "email": "{email}",
-    "secret": "{secret}",
-    "url": "{page_url}",
-    "answer": <value>
-  }}
-}}
-If unsure, set answer=null.
+# =====================================================
+# FALLBACK SOLVERS
+# =====================================================
 
-Page:
-{page_text}
-"""
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role":"system", "content":"Return only valid JSON."},
-            {"role":"user", "content": user_prompt}
-        ],
-        "max_tokens": LLM_MAX_TOKENS,
-        "temperature": 0
-    }
-    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
-
-    try:
-        r = httpx.post(AIPIPE_URL, json=payload, headers=headers, timeout=60)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        js = safe_extract_json(content)
-        if not js:
-            return {"error":"llm_no_json","raw":content}
-        return {"ok":True,"json":json.loads(js)}
-    except Exception as e:
-        return {"error":"llm_call_failed","detail":str(e)}
-
-# -------------------------
-# PDF + OCR (optional)
-# -------------------------
-def compute_sum_from_pdf_bytes(pdf_bytes: bytes):
-    if not pdfplumber or not pd:
+def solve_pdf(pdf_bytes: bytes):
+    if not pdfplumber:
         return None
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(pdf_bytes)
@@ -155,217 +126,297 @@ def compute_sum_from_pdf_bytes(pdf_bytes: bytes):
         with pdfplumber.open(path) as pdf:
             if len(pdf.pages) < 2:
                 return None
-            text = pdf.pages[1].extract_text() or ""
-            nums = re.findall(r"-?\d+(?:\.\d+)?", text)
+            t = pdf.pages[1].extract_text() or ""
+            nums = re.findall(r"-?\d+(\.\d+)?", t)
             if nums:
-                return sum(float(x) for x in nums)
+                return sum([float(x[0] if isinstance(x, tuple) else x) for x in nums])
     except:
-        pass
+        return None
     finally:
-        try: os.remove(path)
-        except: pass
+        os.remove(path)
     return None
 
-def ocr_image_bytes(b: bytes):
-    if not Image or not pytesseract:
-        return ""
-    try:
-        img = Image.open(io.BytesIO(b)).convert("RGB")
-        return pytesseract.image_to_string(img)
-    except:
-        return ""
 
-# -------------------------
-# Fetch URL
-# -------------------------
-async def fetch_url_text_and_assets(url: str, client):
+def solve_table(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    t = soup.find("table")
+    if not t:
+        return None
+    rows = t.find_all("tr")
+    if not rows:
+        return None
+
+    headers = [c.get_text(strip=True).lower() for c in rows[0].find_all(["td", "th"])]
+
+    if "value" not in headers:
+        return None
+
+    idx = headers.index("value")
+    total = 0
+    found = False
+
+    for r in rows[1:]:
+        cells = r.find_all(["td", "th"])
+        if len(cells) <= idx:
+            continue
+        v = re.sub(r"[^0-9.\-]", "", cells[idx].get_text())
+        try:
+            total += float(v)
+            found = True
+        except:
+            pass
+
+    return total if found else None
+
+
+def solve_ocr(img_bytes: bytes):
+    if not Image or not pytesseract:
+        return None
     try:
-        r = await client.get(url, timeout=30)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        t = pytesseract.image_to_string(img)
+        nums = re.findall(r"-?\d+(\.\d+)?", t)
+        if nums:
+            return float(nums[0][0] if isinstance(nums[0], tuple) else nums[0])
+    except:
+        return None
+    return None
+
+
+def solve_puzzle(text: str):
+    """Look for base64 → gzip puzzle."""
+    m = re.search(r'"payload_gz_b64"\s*:\s*"([^"]+)"', text)
+    if not m:
+        return None
+
+    b64 = m.group(1)
+    try:
+        raw = base64.b64decode(b64)
+        gun = gzip.decompress(raw)
+        js = json.loads(gun)
+        return js.get("secret_sum")
+    except:
+        return None
+
+
+# =====================================================
+# LLM SOLVER (GEMINI via OpenRouter)
+# =====================================================
+
+def call_llm(text: str, html: str, url: str, email: str) -> Dict[str, Any]:
+    if not AIPIPE_TOKEN:
+        return {"error": "NO_API_KEY"}
+
+    origin = get_origin(url)
+    default_submit = f"{origin}/submit"
+
+    prompt = f"""
+You must return ONLY one JSON object:
+
+{{
+  "answer": <value>,
+  "submit_url": "<submit>",
+  "submit_payload": {{
+     "email": "{email}",
+     "secret": "{SECRET_KEY}",
+     "url": "{url}",
+     "answer": <value>
+  }}
+}}
+
+Rules:
+- Read PAGE_TEXT and PAGE_HTML
+- If unsure, answer: "anything you want"
+- submit_url must be absolute; default = {default_submit}
+
+PAGE_TEXT:
+{text}
+
+PAGE_HTML:
+{html}
+"""
+
+    headers = {
+        "Authorization": f"Bearer {AIPIPE_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": MODEL,
+        "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": "Return only JSON. No explanation."},
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    try:
+        r = httpx.post(OPENROUTER_URL, json=payload, headers=headers, timeout=40)
         r.raise_for_status()
-        html = r.text
+        content = r.json()["choices"][0]["message"]["content"]
+        js = safe_json(content)
+        if js:
+            return {"ok": True, "json": js}
+        return {"error": "NO_JSON"}
     except Exception as e:
         return {"error": str(e)}
 
-    text = extract_text_and_decode(html)
-    assets = {"pdf": [], "images": [], "audio": []}
 
-    for m in re.finditer(r'href=["\']([^"\']+\.pdf)["\']', html):  
-        assets["pdf"].append(m.group(1))
-    for m in re.finditer(r'src=["\']([^"\']+\.(png|jpg|jpeg))["\']', html):
-        assets["images"].append(m.group(1))
-    for m in re.finditer(r'src=["\']([^"\']+\.(mp3|wav|m4a))["\']', html):
-        assets["audio"].append(m.group(1))
+# =====================================================
+# SOLVE PAGE
+# =====================================================
 
-    return {"html": html, "text": text, "assets": assets}
-
-# -------------------------
-# Solve page
-# -------------------------
-async def solve_task_for_page(url, client, email, secret):
-    res = await fetch_url_text_and_assets(url, client)
-    if "error" in res:
-        return {"answer":"anything you want",
-                "submit_payload":{"email":email,"secret":secret,"url":url,"answer":"anything you want"}}
-
-    html = res["html"]
-    text = res["text"]
-    assets = res["assets"]
+async def solve_page(url: str, email: str, client):
     origin = get_origin(url)
 
-    def abs(u):
-        if not u: return u
-        if u.startswith("http"): return u
-        if u.startswith("/"): return origin + u
-        return origin + "/" + u.lstrip("/")
+    # Fetch page
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        html = r.text
+        text = extract_text(html)
+    except:
+        return {"answer": "anything you want",
+                "submit_url": f"{origin}/submit",
+                "submit_payload": {
+                    "email": email,
+                    "secret": SECRET_KEY,
+                    "url": url,
+                    "answer": "anything you want"
+                }}
 
-    # PDF
-    if assets["pdf"]:
-        try:
-            r = await client.get(abs(assets["pdf"][0]))
-            r.raise_for_status()
-            s = compute_sum_from_pdf_bytes(r.content)
-            if s is not None:
-                return {"answer":s,"submit_payload":{"email":email,"secret":secret,"url":url,"answer":s}}
-        except:
-            pass
+    # Fallback: table
+    t = solve_table(html)
+    if t is not None:
+        return {
+            "answer": t,
+            "submit_url": f"{origin}/submit",
+            "submit_payload": {
+                "email": email,
+                "secret": SECRET_KEY,
+                "url": url,
+                "answer": t
+            }
+        }
 
-    # Table HTML
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    if table:
-        try:
-            rows = table.find_all("tr")
-            headers = [c.get_text().strip().lower() for c in rows[0].find_all(["td","th"])]
-            if "value" in headers:
-                idx = headers.index("value")
-                total = 0
-                found = False
-                for row in rows[1:]:
-                    cols = row.find_all(["td","th"])
-                    if len(cols) > idx:
-                        v = re.sub(r"[^0-9.\-]","",cols[idx].get_text())
-                        try:
-                            total += float(v)
-                            found = True
-                        except:
-                            pass
-                if found:
-                    return {"answer":total,"submit_payload":{"email":email,"secret":secret,"url":url,"answer":total}}
-        except:
-            pass
+    # Fallback: puzzle
+    p = solve_puzzle(text)
+    if p is not None:
+        return {
+            "answer": p,
+            "submit_url": f"{origin}/submit",
+            "submit_payload": {
+                "email": email,
+                "secret": SECRET_KEY,
+                "url": url,
+                "answer": p
+            }
+        }
 
-    # Image OCR
-    if assets["images"]:
-        try:
-            r = await client.get(abs(assets["images"][0]))
-            txt = ocr_image_bytes(r.content)
-            m = re.search(r"-?\d+(?:\.\d+)?", txt)
-            if m:
-                val = float(m.group(0))
-                return {"answer":val,"submit_payload":{"email":email,"secret":secret,"url":url,"answer":val}}
-        except:
-            pass
+    # LLM solver
+    out = call_llm(text, html, url, email)
+    if out.get("ok"):
+        js = out["json"]
+        ans = js.get("answer", "anything you want")
+        submit_url = abs_url(origin, js.get("submit_url"))
+        payload = js.get("submit_payload", {})
 
-    # AUDIO — fallback only
-    if assets["audio"]:
-        log("[WARN] Audio task detected — using fallback answer")
-        return {"answer":"anything you want","submit_payload":{"email":email,"secret":secret,"url":url,"answer":"anything you want"}}
+        # *** CRITICAL PATCH — ALWAYS FIX URL ***
+        payload["url"] = url          # override wrong /demo from LLM
+        payload["secret"] = SECRET_KEY
 
-    # LLM fallback
-    llm = ask_llm_strict(text + "\n\n" + html, url, email, secret)
-    if llm.get("error"):
-        return {"answer":"anything you want","submit_payload":{"email":email,"secret":secret,"url":url,"answer":"anything you want"}}
+        return {
+            "answer": ans,
+            "submit_url": submit_url,
+            "submit_payload": payload
+        }
 
-    js = llm["json"]
-    ans = js.get("answer") or "anything you want"
-    return {"answer":ans,"submit_payload":js.get("submit_payload"),"submit_url":js.get("submit_url")}
+    # emergency fallback
+    return {
+        "answer": "anything you want",
+        "submit_url": f"{origin}/submit",
+        "submit_payload": {
+            "email": email,
+            "secret": SECRET_KEY,
+            "url": url,
+            "answer": "anything you want"
+        }
+    }
 
-# -------------------------
-# Orchestrator Loop
-# -------------------------
-async def orchestrator(email, secret, start_url):
-    deadline = time.time() + TOTAL_DEADLINE_SECONDS
+
+# =====================================================
+# ORCHESTRATOR
+# =====================================================
+
+async def orchestrator(email: str, url: str):
     client = httpx.AsyncClient()
-    current = start_url
+    deadline = time.time() + DEADLINE
+    current = url
 
     while current and time.time() < deadline:
-        log("[DEBUG] Fetching:", current)
-        solved = await solve_task_for_page(current, client, email, secret)
+        log("[TASK]", current)
 
-        submit_payload = solved.get("submit_payload") or {
-            "email": email, "secret": secret, "url": current, "answer": solved.get("answer")
-        }
-        submit_url = solved.get("submit_url") or f"{get_origin(current)}/submit"
+        solved = await solve_page(current, email, client)
+        submit_url = solved["submit_url"]
+        payload = solved["submit_payload"]
 
-        if not submit_payload.get("answer"):
-            submit_payload["answer"] = "anything you want"
+        # *** CRITICAL PATCH — ensure absolute URL ***
+        payload["url"] = current
 
-        attempt = 0
+        log("[SUBMIT]", submit_url)
+        log("[PAYLOAD]", payload)
+
         last = {}
-        while attempt <= MAX_RETRIES:
-            attempt += 1
-            log("[DEBUG] Submitting to:", submit_url, "attempt:", attempt)
-            log("[DEBUG] Payload:", submit_payload)
 
+        for _ in range(MAX_RETRIES):
             try:
-                r = await client.post(submit_url, json=submit_payload)
-                try: rj = r.json()
-                except: rj = {"text": r.text}
-            except Exception as e:
-                rj = {"error":str(e)}
+                r = await client.post(submit_url, json=payload, timeout=30)
+                try:
+                    jr = r.json()
+                except:
+                    jr = {}
+            except:
+                jr = {}
 
-            log("[DEBUG] Response:", rj)
-            last = rj
+            log("[RESPONSE]", jr)
 
-            if rj.get("delay"):
-                d = int(rj["delay"])
-                log(f"[DEBUG] Waiting {d}s")
-                await asyncio.sleep(d)
+            last = jr
 
-            if rj.get("correct"):
-                if rj.get("url"):
-                    current = rj["url"]
-                else:
-                    log("[DEBUG] Finished.")
+            if jr.get("correct") and jr.get("url"):
+                current = jr["url"]
                 break
 
-            if "secret mismatch" in (rj.get("reason") or "").lower() and attempt <= MAX_RETRIES:
-                if "?" in submit_url:
-                    submit_url += f"&secret={secret}"
-                else:
-                    submit_url += f"?secret={secret}"
-                continue
+            if jr.get("correct") and not jr.get("url"):
+                log("[END] Finished.")
+                return
 
-            if attempt > MAX_RETRIES:
+            if jr.get("url"):
+                current = jr["url"]
                 break
 
-        next_url = last.get("url")
-        if next_url:
-            current = next_url
         else:
-            log("[DEBUG] No next_url; stopping.")
+            log("[END] No next URL → stopping.")
             return
 
-    log("[ERROR] Deadline exceeded or no URL left.")
 
-def run_orchestrator_sync(email, secret, url):
-    asyncio.run(orchestrator(email, secret, url))
+# =====================================================
+# API ENDPOINT
+# =====================================================
 
-# -------------------------
-# API Endpoint
-# -------------------------
 @app.post("/api/quiz")
-async def api_quiz(request: Request, background: BackgroundTasks):
-    data = await request.json()
+async def api_quiz(req: Request, bg: BackgroundTasks):
+    data = await req.json()
     email = data.get("email")
     secret = data.get("secret")
     url = data.get("url")
 
-    if not email or not secret or not url:
-        raise HTTPException(status_code=400, detail="email, secret, url required")
-
     if secret != SECRET_KEY:
-        raise HTTPException(status_code=403, detail="Invalid secret")
+        raise HTTPException(403, "Invalid secret")
 
-    background.add_task(run_orchestrator_sync, email, secret, url)
-    return {"status":"accepted","email":email,"url":url}
+    if not email or not url:
+        raise HTTPException(400, "Missing parameters")
+
+    bg.add_task(orchestrator, email, url)
+    return {"status": "accepted"}
+
+
