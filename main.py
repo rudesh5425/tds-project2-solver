@@ -10,7 +10,7 @@ import io
 import tempfile
 from typing import Dict, Any
 
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from bs4 import BeautifulSoup
 
 # Optional fallbacks
@@ -56,7 +56,6 @@ def get_origin(url: str):
 
 
 def abs_url(origin: str, u: str):
-    """Ensure u is a full URL."""
     if not u:
         return origin
     if u.startswith("http"):
@@ -67,7 +66,6 @@ def abs_url(origin: str, u: str):
 
 
 def extract_text(html: str):
-    """Extract all visible text + atob decoded content."""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
 
@@ -93,7 +91,6 @@ def extract_text(html: str):
 
 
 def safe_json(s: str):
-    """Extract first valid JSON object."""
     s = s.strip()
     start = s.find("{")
     if start == -1:
@@ -127,9 +124,9 @@ def solve_pdf(pdf_bytes: bytes):
             if len(pdf.pages) < 2:
                 return None
             t = pdf.pages[1].extract_text() or ""
-            nums = re.findall(r"-?\d+(\.\d+)?", t)
+            nums = re.findall(r"-?\d+(?:\.\d+)?", t)
             if nums:
-                return sum([float(x[0] if isinstance(x, tuple) else x) for x in nums])
+                return sum(float(n) for n in nums)
     except:
         return None
     finally:
@@ -153,7 +150,6 @@ def solve_table(html: str):
 
     idx = headers.index("value")
     total = 0
-    found = False
 
     for r in rows[1:]:
         cells = r.find_all(["td", "th"])
@@ -162,11 +158,10 @@ def solve_table(html: str):
         v = re.sub(r"[^0-9.\-]", "", cells[idx].get_text())
         try:
             total += float(v)
-            found = True
         except:
             pass
 
-    return total if found else None
+    return total
 
 
 def solve_ocr(img_bytes: bytes):
@@ -175,59 +170,53 @@ def solve_ocr(img_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         t = pytesseract.image_to_string(img)
-        nums = re.findall(r"-?\d+(\.\d+)?", t)
+        nums = re.findall(r"-?\d+(?:\.\d+)?", t)
         if nums:
-            return float(nums[0][0] if isinstance(nums[0], tuple) else nums[0])
+            return float(nums[0])
     except:
         return None
     return None
 
 
 def solve_puzzle(text: str):
-    """Look for base64 → gzip puzzle."""
     m = re.search(r'"payload_gz_b64"\s*:\s*"([^"]+)"', text)
     if not m:
         return None
-
-    b64 = m.group(1)
     try:
-        raw = base64.b64decode(b64)
-        gun = gzip.decompress(raw)
-        js = json.loads(gun)
+        raw = base64.b64decode(m.group(1))
+        js = json.loads(gzip.decompress(raw))
         return js.get("secret_sum")
     except:
         return None
 
 
 # =====================================================
-# LLM SOLVER (GEMINI via OpenRouter)
+# LLM SOLVER
 # =====================================================
 
-def call_llm(text: str, html: str, url: str, email: str) -> Dict[str, Any]:
+def call_llm(text: str, html: str, url: str, email: str):
     if not AIPIPE_TOKEN:
-        return {"error": "NO_API_KEY"}
+        return {"error": "NO_KEY"}
 
     origin = get_origin(url)
     default_submit = f"{origin}/submit"
 
     prompt = f"""
-You must return ONLY one JSON object:
+Return ONLY this JSON format:
 
 {{
   "answer": <value>,
-  "submit_url": "<submit>",
+  "submit_url": "<url>",
   "submit_payload": {{
-     "email": "{email}",
-     "secret": "{SECRET_KEY}",
-     "url": "{url}",
-     "answer": <value>
+    "email": "{email}",
+    "secret": "{SECRET_KEY}",
+    "url": "{url}",
+    "answer": <value>
   }}
 }}
 
-Rules:
-- Read PAGE_TEXT and PAGE_HTML
-- If unsure, answer: "anything you want"
-- submit_url must be absolute; default = {default_submit}
+If unsure: answer = "anything you want".
+submit_url must be absolute (default: {default_submit}).
 
 PAGE_TEXT:
 {text}
@@ -243,9 +232,9 @@ PAGE_HTML:
 
     payload = {
         "model": MODEL,
-        "temperature": 0.3,
+        "temperature": 0.2,
         "messages": [
-            {"role": "system", "content": "Return only JSON. No explanation."},
+            {"role": "system", "content": "Return only JSON."},
             {"role": "user", "content": prompt}
         ]
     }
@@ -255,9 +244,7 @@ PAGE_HTML:
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
         js = safe_json(content)
-        if js:
-            return {"ok": True, "json": js}
-        return {"error": "NO_JSON"}
+        return {"ok": True, "json": js} if js else {"error": "NO_JSON"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -269,69 +256,62 @@ PAGE_HTML:
 async def solve_page(url: str, email: str, client):
     origin = get_origin(url)
 
-    # Fetch page
     try:
         r = await client.get(url)
         r.raise_for_status()
         html = r.text
-        text = extract_text(html)
     except:
-        return {"answer": "anything you want",
-                "submit_url": f"{origin}/submit",
-                "submit_payload": {
-                    "email": email,
-                    "secret": SECRET_KEY,
-                    "url": url,
-                    "answer": "anything you want"
-                }}
+        return {
+            "answer": "anything you want",
+            "submit_url": f"{origin}/submit",
+            "submit_payload": {
+                "email": email,
+                "secret": SECRET_KEY,
+                "url": url,
+                "answer": "anything you want"
+            }
+        }
 
-    # Fallback: table
+    text = extract_text(html)
+
+    # --- table fallback
     t = solve_table(html)
     if t is not None:
         return {
             "answer": t,
             "submit_url": f"{origin}/submit",
             "submit_payload": {
-                "email": email,
-                "secret": SECRET_KEY,
-                "url": url,
-                "answer": t
+                "email": email, "secret": SECRET_KEY, "url": url, "answer": t
             }
         }
 
-    # Fallback: puzzle
+    # --- puzzle fallback
     p = solve_puzzle(text)
     if p is not None:
         return {
             "answer": p,
             "submit_url": f"{origin}/submit",
             "submit_payload": {
-                "email": email,
-                "secret": SECRET_KEY,
-                "url": url,
-                "answer": p
+                "email": email, "secret": SECRET_KEY, "url": url, "answer": p
             }
         }
 
-    # LLM solver
+    # --- LLM
     out = call_llm(text, html, url, email)
     if out.get("ok"):
         js = out["json"]
         ans = js.get("answer", "anything you want")
         submit_url = abs_url(origin, js.get("submit_url"))
         payload = js.get("submit_payload", {})
-
-        # *** CRITICAL PATCH — ALWAYS FIX URL ***
-        payload["url"] = url          # override wrong /demo from LLM
+        payload["url"] = url
         payload["secret"] = SECRET_KEY
-
         return {
             "answer": ans,
             "submit_url": submit_url,
             "submit_payload": payload
         }
 
-    # emergency fallback
+    # fallback
     return {
         "answer": "anything you want",
         "submit_url": f"{origin}/submit",
@@ -359,8 +339,6 @@ async def orchestrator(email: str, url: str):
         solved = await solve_page(current, email, client)
         submit_url = solved["submit_url"]
         payload = solved["submit_payload"]
-
-        # *** CRITICAL PATCH — ensure absolute URL ***
         payload["url"] = current
 
         log("[SUBMIT]", submit_url)
@@ -379,7 +357,6 @@ async def orchestrator(email: str, url: str):
                 jr = {}
 
             log("[RESPONSE]", jr)
-
             last = jr
 
             if jr.get("correct") and jr.get("url"):
@@ -404,7 +381,7 @@ async def orchestrator(email: str, url: str):
 # =====================================================
 
 @app.post("/api/quiz")
-async def api_quiz(req: Request, bg: BackgroundTasks):
+async def api_quiz(req: Request):
     data = await req.json()
     email = data.get("email")
     secret = data.get("secret")
@@ -412,11 +389,15 @@ async def api_quiz(req: Request, bg: BackgroundTasks):
 
     if secret != SECRET_KEY:
         raise HTTPException(403, "Invalid secret")
-
     if not email or not url:
         raise HTTPException(400, "Missing parameters")
 
-    bg.add_task(orchestrator, email, url)
+    # FIX: schedule async orchestrator inside active event loop
+    asyncio.create_task(orchestrator(email, url))
+
     return {"status": "accepted"}
 
 
+@app.get("/")
+def root():
+    return {"status": "running", "version": "final-prod-A"}
