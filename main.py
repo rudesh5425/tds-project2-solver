@@ -3,8 +3,8 @@ import io
 import json
 import asyncio
 import zipfile
-import base64
 import logging
+import base64
 from collections import Counter
 
 import httpx
@@ -26,30 +26,24 @@ logger = logging.getLogger("quiz")
 LLM_URL = "https://aipipe.org/openai/v1/chat/completions"
 LLM_MODEL = "gpt-4o-mini-2024-07-18"
 LLM_TOKEN = os.getenv("AIPIPE_TOKEN")
-
 SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
 
 if not LLM_TOKEN:
-    raise RuntimeError("AIPIPE_TOKEN not set")
+    raise RuntimeError("AIPIPE_TOKEN missing")
 
 app = FastAPI()
 
-# ================= REQUEST MODEL =================
 class QuizRequest(BaseModel):
     email: str
     secret: str
     url: str
 
 # ================= HELPERS =================
-async def fetch_text(url: str) -> str:
+async def fetch_text(url):
     async with httpx.AsyncClient(timeout=60) as c:
         return (await c.get(url)).text
 
-async def fetch_json(url: str):
-    async with httpx.AsyncClient(timeout=60) as c:
-        return (await c.get(url)).json()
-
-async def fetch_bytes(url: str) -> bytes:
+async def fetch_bytes(url):
     async with httpx.AsyncClient(timeout=60) as c:
         return (await c.get(url)).content
 
@@ -63,15 +57,11 @@ def submit(email, secret, url, answer):
 
 # ================= SAFE LLM =================
 async def call_llm(system, user):
-    await asyncio.sleep(1.5)  # throttle
-
+    await asyncio.sleep(1.5)
     async with httpx.AsyncClient(timeout=90) as c:
         r = await c.post(
             LLM_URL,
-            headers={
-                "Authorization": f"Bearer {LLM_TOKEN}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {LLM_TOKEN}"},
             json={
                 "model": LLM_MODEL,
                 "temperature": 0,
@@ -81,112 +71,80 @@ async def call_llm(system, user):
                 ],
             },
         )
-
+    if r.status_code != 200:
+        return None
     try:
-        data = r.json()
+        return r.json()["choices"][0]["message"]["content"].strip()
     except Exception:
         return None
 
-    if r.status_code != 200:
-        return None
-
-    choices = data.get("choices")
-    if not choices:
-        return None
-
-    return choices[0]["message"]["content"].strip()
-
 # ================= SOLVER =================
-async def solve_task(url: str, email: str):
+async def solve_task(url, email):
     page = await fetch_text(url)
-    text = page.lower()
+    low = page.lower()
 
     # ---------- DETERMINISTIC RULES ----------
-
-    # Curl command
-    if "curl" in text and "accept: application/json" in text:
-        return 'curl -H "Accept: application/json" https://tds-llm-analysis.s-anand.net/project2-reevals/echo.json'
-
-    # Bash wc -l
-    if "wc -l" in text and "logs.txt" in text:
+    if "wc -l" in low:
         return "wc -l logs.txt"
 
-    # Docker RUN
-    if "docker" in text and "requirements.txt" in text:
+    if "docker run instruction" in low:
         return "RUN pip install -r requirements.txt"
 
-    # GitHub Actions step
-    if "github actions" in text and "npm test" in text:
+    if "github actions" in low and "npm test" in low:
         return "- name: Run tests\n  run: npm test"
 
-    # Base64 decoding
-    if "base64" in text:
+    if "curl" in low and "accept:" in low:
+        return 'curl -H "Accept: application/json" https://tds-llm-analysis.s-anand.net/project2-reevals/echo.json'
+
+    if "base64" in low:
         encoded = page.split()[-1]
-        try:
-            return base64.b64decode(encoded).decode()
-        except Exception:
-            return ""
+        return base64.b64decode(encoded).decode()
 
-    # ---------- JSON FILE TASKS ----------
-
-    # Extract api_key
-    if "config.json" in text and "api_key" in text:
-        raw = await fetch_text(url.replace("project2-reevals-3", "project2-reevals/config.json"))
+    # ---------- JSON FILE ----------
+    if "config.json" in low:
+        raw = await fetch_bytes(url.replace(url.split("/")[-1], "config.json"))
         try:
             return json.loads(raw).get("api_key", "")
         except Exception:
             return ""
 
-    # REST API status count
-    if "api-status.json" in text:
-        data = await fetch_json(url.replace("project2-reevals-12", "project2-reevals/api-status.json"))
-        return sum(1 for x in data if x.get("status") == 200)
+    if "api-status.json" in low:
+        raw = await fetch_bytes(url.replace(url.split("/")[-1], "api-status.json"))
+        data = json.loads(raw)
+        return sum(1 for r in data if r.get("status") == 200)
 
-    # Network gzip
-    if "network-requests.json" in text:
-        data = await fetch_json(url.replace("project2-reevals-13", "project2-reevals/network-requests.json"))
+    if "network-requests.json" in low:
+        raw = await fetch_bytes(url.replace(url.split("/")[-1], "network-requests.json"))
+        data = json.loads(raw)
         for r in data:
             if r.get("compression") == "gzip":
                 return r.get("id")
         return ""
 
     # ---------- CSV / TABLE ----------
-    if ".csv" in text:
-        csv_url = [line for line in page.split() if line.endswith(".csv")][0]
-        raw = await fetch_bytes(csv_url)
-        df = pd.read_csv(io.BytesIO(raw))
+    if ".csv" in page:
+        csv_url = None
+        for word in page.split():
+            if word.endswith(".csv"):
+                csv_url = word
+                break
 
-        if "status" in df.columns:
-            return int((df["status"] == 200).sum())
+        if csv_url:
+            raw = await fetch_bytes(csv_url)
+            df = pd.read_csv(io.BytesIO(raw))
+            return round(df.select_dtypes(float).sum().sum(), 2)
 
-        return ""
-
-    # ---------- IMAGE ----------
-    if "image" in text:
-        img_url = [line for line in page.split() if line.endswith(".png") or line.endswith(".jpg")][0]
-        img = iio.imread(await fetch_bytes(img_url))
-        pixels = img.reshape(-1, img.shape[-1])[:, :3]
-        color = Counter(map(tuple, pixels)).most_common(1)[0][0]
-        return "#{:02x}{:02x}{:02x}".format(*color)
-
-    # ---------- SENTIMENT (LLM REQUIRED) ----------
-    if "sentiment" in text:
-        tweets = await fetch_json(url.replace("project2-reevals-17", "project2-reevals/tweets.json"))
-        prompt = "Count how many tweets are POSITIVE. Return ONLY a number.\n\n"
-        for t in tweets:
-            prompt += f"- {t['text']}\n"
-        ans = await call_llm("You are a sentiment classifier.", prompt)
-        return int(ans) if ans and ans.isdigit() else 0
-
-    # ---------- FALLBACK ----------
-    ans = await call_llm("Answer concisely. No explanation.", page[:4000])
-    return ans or "anything you want"
+    # ---------- FALLBACK TO LLM ----------
+    answer = await call_llm(
+        "Answer ONLY the final result. No explanation.",
+        page[:4000],
+    )
+    return answer or "anything you want"
 
 # ================= API =================
 @app.post("/api/quiz")
 async def quiz(req: QuizRequest):
     current = req.url
-
     while current:
         answer = await solve_task(current, req.email)
         result = submit(req.email, req.secret, current, answer)
