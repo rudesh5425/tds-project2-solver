@@ -6,3 +6,4 @@ numpy
 imageio
 openpyxl
 pydantic
+tabulate
